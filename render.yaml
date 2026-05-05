@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: tardigrade-lab
+    runtime: python
+    pythonVersion: "3.11.10"
+    region: oregon
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.10"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # The following secrets must be set in Render's dashboard
+      # (Environment → Environment Variables). They are NOT in this file.
+      #
+      # ADMIN_USERNAME, ADMIN_PASSWORD_HASH, ADMIN_SESSION_SECRET
+      # SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY
+      # GITHUB_TOKEN, GITHUB_REPO
+      # FORMSPREE_API_KEY, FORMSPREE_FORM_ID
+      # PLAUSIBLE_SITE_ID, PLAUSIBLE_API_KEY    (optional)
+      # GROQ_API_KEY
+      # RENDER_DEPLOY_HOOK_URL                  (for "Trigger rebuild" button)
+      # STRIPE_SECRET_KEY                       (post shop launch only)
