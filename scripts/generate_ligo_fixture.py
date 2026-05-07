@@ -246,6 +246,7 @@ def main():
         sample_rate=np.array(SAMPLE_RATE),
         n_samples=np.array(N_SAMPLES),
         seed=np.array(args.seed),
+        source=np.array("synthetic-pycbc"),
     )
 
     size_mb = out_path.stat().st_size / 1024 / 1024

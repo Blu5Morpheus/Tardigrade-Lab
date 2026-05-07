@@ -1,16 +1,22 @@
 """Demo 02 — Clifford geometric algebra agent.
 
-Equivariance demonstration in Cl(3,0) and Cl(3,1). Multivectors are encoded
-as length-2^n arrays indexed by basis-blade bitmasks. The geometric product
-is implemented from the signature directly — no third-party clifford pkg.
+Two modes share the same Cl(p,q) machinery:
 
-The headline numerical fact: ‖f(g·x) − g·f(x)‖ stays at machine precision
-for any rotor g and any input x.
+  1. Equivariance demonstration — pick an input x and a transform g,
+     show that ‖f(g·x) − g·f(x)‖ stays at machine precision.
+  2. LIGO classifier — train a small Clifford-rotor classifier on the
+     LIGO O3 strain fixture (real GWOSC events vs. blip/sine-Gaussian
+     glitches injected on real noise) and report identification metrics.
+
+Multivectors are encoded as length-2^n arrays indexed by basis-blade
+bitmasks. The geometric product is implemented from the signature
+directly — no third-party clifford pkg.
 """
 
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -22,6 +28,9 @@ from lib.theme import PALETTE, apply_plotly_theme
 
 Algebra = Literal["Cl(3,0)", "Cl(3,1)"]
 Transform = Literal["Rotation", "Boost", "Reflection"]
+Mode = Literal["Equivariance check", "LIGO classifier"]
+
+LIGO_FIXTURE = Path(__file__).resolve().parent.parent / "data" / "ligo_strain_sample.npz"
 
 
 # ----- algebra primitives -----
@@ -149,14 +158,344 @@ class CliffordLayer:
         return apply_rotor(self.R, x, self.sig)
 
 
+# ----- LIGO classifier (real-data Clifford identifier) -----
+
+def _strain_to_features(strain: np.ndarray, n_features: int) -> np.ndarray:
+    """Map a (B, 256) strain batch to (B, n_features) by averaging chunks of |x|.
+
+    Using |strain| means the feature is sensitive to envelope shape —
+    chirps concentrate energy into the middle samples; blips spread it.
+    """
+    B, T = strain.shape
+    chunks = np.array_split(np.arange(T), n_features)
+    feats = np.stack([np.abs(strain[:, c]).mean(axis=1) for c in chunks], axis=1)
+    # standardize column-wise
+    mu = feats.mean(axis=0, keepdims=True)
+    sd = feats.std(axis=0, keepdims=True) + 1e-9
+    return (feats - mu) / sd
+
+
+def _build_rotor(angles: np.ndarray, sig: tuple[int, int, int]) -> np.ndarray:
+    """Compose elementary plane-rotors R = R_{12} · R_{13} · R_{23}.
+
+    Each angles[i] parameterizes one bivector plane. For Cl(3,0), all
+    three bivectors square to -1 → all elementary rotors are elliptic.
+    """
+    n = sig[0] + sig[1]
+    dim = 1 << n
+    R = np.zeros(dim)
+    R[0] = 1.0
+    planes = [(0, 1), (0, 2), (1, 2)]
+    for k, (i, j) in enumerate(planes[:len(angles)]):
+        B = np.zeros(dim)
+        B[_bivector_basis_index(i, j, n)] = 1.0
+        R = geometric_product(rotor_from_bivector(B, float(angles[k]), sig), R, sig)
+    # renormalize R so R R̃ = 1 (numerical drift)
+    norm_sq = float(geometric_product(R, reverse(R), sig)[0])
+    if norm_sq > 0:
+        R = R / np.sqrt(norm_sq)
+    return R
+
+
+def _clifford_forward(
+    feats: np.ndarray,
+    angles: np.ndarray,
+    head: np.ndarray,
+    sig: tuple[int, int, int],
+) -> np.ndarray:
+    """Lift feats to grade-1 multivectors, rotate, project to scalar logits.
+
+    feats: (B, n)  → x: (B, dim) with x[:, 1<<i] = feats[:, i]
+    rotor: dim-vector
+    head:  dim-vector (linear classifier on multivector components)
+    out:   (B,) logits
+    """
+    n = sig[0] + sig[1]
+    dim = 1 << n
+    B = feats.shape[0]
+    X = np.zeros((B, dim))
+    for i in range(n):
+        X[:, 1 << i] = feats[:, i]
+    R = _build_rotor(angles, sig)
+    Rt = reverse(R)
+    Y = np.zeros_like(X)
+    for b_i in range(B):
+        Y[b_i] = geometric_product(geometric_product(R, X[b_i], sig), Rt, sig)
+    return Y @ head
+
+
+def _logistic(z: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -40, 40)))
+
+
+def _train_clifford_classifier(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    sig: tuple[int, int, int],
+    n_features: int,
+    epochs: int,
+    lr: float,
+    seed: int,
+):
+    """Joint optimization of (rotor angles, linear head) on logistic loss.
+
+    Uses central-difference gradients on the rotor angles (3 params)
+    and analytic gradient on the linear head (dim params). Very small
+    parameter count → trivial to optimize.
+    """
+    rng = np.random.default_rng(seed)
+    n = sig[0] + sig[1]
+    dim = 1 << n
+
+    angles = rng.normal(0, 0.2, size=3)
+    head = rng.normal(0, 0.1, size=dim)
+
+    history = []
+    eps = 1e-3
+
+    for ep in range(epochs):
+        # forward
+        logits = _clifford_forward(X_train, angles, head, sig)
+        p = _logistic(logits)
+        loss = -np.mean(y_train * np.log(p + 1e-12) + (1 - y_train) * np.log(1 - p + 1e-12))
+
+        # gradient on head — analytic
+        # d loss / d logits = (p - y) / B
+        n_b = X_train.shape[0]
+        d_logit = (p - y_train) / n_b
+
+        # rebuild Y for the head gradient (Y @ head = logits)
+        # Y = R x R̃ for current rotor
+        R = _build_rotor(angles, sig)
+        Rt = reverse(R)
+        Y = np.zeros((n_b, dim))
+        for b in range(n_b):
+            xv = np.zeros(dim)
+            for i in range(n):
+                xv[1 << i] = X_train[b, i]
+            Y[b] = geometric_product(geometric_product(R, xv, sig), Rt, sig)
+        grad_head = Y.T @ d_logit
+
+        # gradient on angles — finite differences
+        grad_angles = np.zeros_like(angles)
+        for k in range(len(angles)):
+            ap = angles.copy(); ap[k] += eps
+            am = angles.copy(); am[k] -= eps
+            lp = _clifford_forward(X_train, ap, head, sig)
+            lm = _clifford_forward(X_train, am, head, sig)
+            pp = _logistic(lp); pm = _logistic(lm)
+            loss_p = -np.mean(y_train * np.log(pp + 1e-12) + (1 - y_train) * np.log(1 - pp + 1e-12))
+            loss_m = -np.mean(y_train * np.log(pm + 1e-12) + (1 - y_train) * np.log(1 - pm + 1e-12))
+            grad_angles[k] = (loss_p - loss_m) / (2 * eps)
+
+        # step
+        head = head - lr * grad_head
+        angles = angles - lr * grad_angles
+
+        # accuracy
+        acc = float(((p > 0.5).astype(int) == y_train).mean())
+        history.append({"epoch": ep, "loss": float(loss), "accuracy": acc})
+
+    return angles, head, history
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_ligo_fixture():
+    if not LIGO_FIXTURE.exists():
+        return None
+    npz = np.load(LIGO_FIXTURE, allow_pickle=False)
+    out = {"signals": npz["signals"], "glitches": npz["glitches"]}
+    out["source"] = str(npz["source"]) if "source" in npz.files else "unknown"
+    out["n_real_events"] = int(npz["n_real_events"]) if "n_real_events" in npz.files else 0
+    return out
+
+
+def _render_ligo_classifier(embed: bool) -> None:
+    fixture = _load_ligo_fixture()
+    if fixture is None:
+        st.warning(
+            "**LIGO fixture missing.** Run "
+            "`python scripts/fetch_ligo_real.py --output data/ligo_strain_sample.npz` "
+            "(real GWOSC O3) or "
+            "`python scripts/generate_ligo_fixture.py --output data/ligo_strain_sample.npz` "
+            "(synthetic)."
+        )
+        return
+
+    src = fixture.get("source", "unknown")
+    n_real = fixture.get("n_real_events", 0)
+    info = st.columns(3)
+    if src == "gwosc-real-o3":
+        info[0].metric("Data source", "GWOSC O3 (real)")
+        info[1].metric("Real events", n_real)
+    elif src == "synthetic-pycbc":
+        info[0].metric("Data source", "PyCBC (synthetic)")
+        info[1].metric("Real events", "0")
+    else:
+        info[0].metric("Data source", src)
+        info[1].metric("Real events", n_real)
+    info[2].metric("Algebra", "Cl(3,0)")
+
+    with st.sidebar:
+        st.markdown("### Classifier")
+        n_each = st.slider(
+            "Examples per class",
+            50, min(500, len(fixture["signals"]), len(fixture["glitches"])),
+            200, step=50,
+        )
+        epochs = st.slider("Epochs", 5, 80, 30)
+        lr = st.number_input("Learning rate", 0.001, 1.0, 0.1, 0.01, format="%.3f")
+        seed = int(st.number_input("Seed", value=7, step=1))
+        run = st.button("Train Clifford classifier", type="primary", use_container_width=True)
+
+    sig = _signature("Cl(3,0)")
+    n_basis = sig[0] + sig[1]
+
+    rng = np.random.default_rng(seed)
+    sigs = fixture["signals"]
+    glis = fixture["glitches"]
+    s_idx = rng.choice(len(sigs), size=n_each, replace=False)
+    g_idx = rng.choice(len(glis), size=n_each, replace=False)
+    raw = np.vstack([sigs[s_idx], glis[g_idx]])
+    y = np.concatenate([np.ones(n_each, dtype=np.float64), np.zeros(n_each, dtype=np.float64)])
+    perm = rng.permutation(len(raw))
+    raw, y = raw[perm], y[perm]
+
+    # 80/20 split
+    cut = int(0.8 * len(raw))
+    feats = _strain_to_features(raw, n_basis)
+    X_train, X_test = feats[:cut], feats[cut:]
+    y_train, y_test = y[:cut], y[cut:]
+
+    if run:
+        with st.spinner("Training Clifford-rotor classifier on LIGO strain windows…"):
+            try:
+                angles, head, history = _train_clifford_classifier(
+                    X_train, y_train, sig, n_basis, int(epochs), float(lr), seed,
+                )
+            except Exception as e:
+                st.error(f"Training failed: {e}")
+                return
+        test_logits = _clifford_forward(X_test, angles, head, sig)
+        test_p = _logistic(test_logits)
+        st.session_state.clf_results = dict(
+            angles=angles, head=head, history=history,
+            test_p=test_p, y_test=y_test,
+            train_p=_logistic(_clifford_forward(X_train, angles, head, sig)),
+            y_train=y_train,
+        )
+
+    if "clf_results" not in st.session_state:
+        st.info(
+            "Configure parameters in the sidebar, then click **Train Clifford "
+            "classifier**. The model has 3 rotor angles + 8 linear-head weights."
+        )
+        return
+
+    res = st.session_state.clf_results
+    history = res["history"]
+
+    # learning curves
+    losses = [h["loss"] for h in history]
+    accs = [h["accuracy"] for h in history]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=losses, name="loss", line=dict(color=PALETTE["mint_rim"])))
+    fig.add_trace(go.Scatter(y=accs, name="train acc", line=dict(color=PALETTE["violet_glow"]), yaxis="y2"))
+    fig.update_layout(
+        title="Training", xaxis_title="epoch",
+        yaxis=dict(title="loss"),
+        yaxis2=dict(title="accuracy", overlaying="y", side="right", range=[0, 1]),
+        height=320,
+    )
+    apply_plotly_theme(fig)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # test metrics
+    test_pred = (res["test_p"] > 0.5).astype(int)
+    y_test_int = res["y_test"].astype(int)
+    tp = int(((test_pred == 1) & (y_test_int == 1)).sum())
+    tn = int(((test_pred == 0) & (y_test_int == 0)).sum())
+    fp = int(((test_pred == 1) & (y_test_int == 0)).sum())
+    fn = int(((test_pred == 0) & (y_test_int == 1)).sum())
+    test_acc = (tp + tn) / max(1, tp + tn + fp + fn)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Test accuracy", f"{test_acc * 100:.1f}%")
+    metric_cols[1].metric("True positive", tp)
+    metric_cols[2].metric("False positive", fp)
+    metric_cols[3].metric("False negative", fn)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        cm = go.Figure(data=go.Heatmap(
+            z=[[tn, fp], [fn, tp]],
+            x=["Pred glitch", "Pred chirp"],
+            y=["Actual glitch", "Actual chirp"],
+            text=[[tn, fp], [fn, tp]],
+            texttemplate="%{text}",
+            colorscale=[[0, PALETTE["bg_panel"]], [1, PALETTE["violet_glow"]]],
+            showscale=False,
+        ))
+        cm.update_layout(title="Test confusion matrix", height=320)
+        apply_plotly_theme(cm)
+        st.plotly_chart(cm, use_container_width=True)
+
+    with col2:
+        scores = res["test_p"]
+        order = np.argsort(-scores)
+        ys = y_test_int[order]
+        tpr = np.cumsum(ys) / max(1, ys.sum())
+        fpr = np.cumsum(1 - ys) / max(1, (1 - ys).sum())
+        auc = float(np.trapz(tpr, fpr))
+        roc = go.Figure()
+        roc.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=f"AUC = {auc:.3f}",
+                                 line=dict(color=PALETTE["violet_glow"])))
+        roc.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                                 line=dict(color=PALETTE["violet_deep"], dash="dash"),
+                                 showlegend=False))
+        roc.update_layout(title="Test ROC", xaxis_title="FPR", yaxis_title="TPR", height=320)
+        apply_plotly_theme(roc)
+        st.plotly_chart(roc, use_container_width=True)
+
+    # learned rotor / head summary
+    st.markdown("**Learned parameters**")
+    st.dataframe(
+        pd.DataFrame({
+            "rotor angle (rad)": [f"{a:.3f}" for a in res["angles"]] + [""] * 5,
+            "head weight (per blade)": [f"{w:.3f}" for w in res["head"]],
+        }),
+        use_container_width=True, hide_index=True,
+    )
+
+    if not embed:
+        with st.expander("Show classifier code"):
+            st.code(
+                inspect.getsource(_strain_to_features) + "\n\n"
+                + inspect.getsource(_build_rotor) + "\n\n"
+                + inspect.getsource(_train_clifford_classifier),
+                language="python",
+            )
+
+
 # ----- UI -----
 
 def render(embed: bool = False) -> None:
     if not embed:
         st.caption(
-            "Equivariant Clifford layers: y = R x R̃. "
-            "Picking an input x, a transform g, and showing that f(g·x) = g·f(x) numerically."
+            "Two demos in one: an equivariance check on Clifford layers, "
+            "and a small Clifford-rotor classifier trained on real LIGO O3 strain."
         )
+
+    mode_default = "LIGO classifier" if LIGO_FIXTURE.exists() else "Equivariance check"
+    mode: Mode = st.radio(
+        "Mode", ["Equivariance check", "LIGO classifier"],
+        index=["Equivariance check", "LIGO classifier"].index(mode_default),
+        horizontal=True,
+    )
+
+    if mode == "LIGO classifier":
+        _render_ligo_classifier(embed=embed)
+        return
 
     with st.sidebar:
         st.markdown("### Parameters")

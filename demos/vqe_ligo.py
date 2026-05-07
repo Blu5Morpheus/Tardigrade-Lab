@@ -28,8 +28,40 @@ FIXTURE_PATH = Path(__file__).resolve().parent.parent / "data" / "ligo_strain_sa
 def load_fixture():
     if not FIXTURE_PATH.exists():
         return None
-    npz = np.load(FIXTURE_PATH)
-    return {"signals": npz["signals"], "glitches": npz["glitches"]}
+    npz = np.load(FIXTURE_PATH, allow_pickle=False)
+    out = {"signals": npz["signals"], "glitches": npz["glitches"]}
+    # source/provenance — tolerate older fixtures without these keys
+    out["source"] = str(npz["source"]) if "source" in npz.files else "unknown"
+    out["sample_rate"] = int(npz["sample_rate"]) if "sample_rate" in npz.files else 4096
+    out["n_real_events"] = int(npz["n_real_events"]) if "n_real_events" in npz.files else 0
+    return out
+
+
+def _fetch_real_ligo_data() -> tuple[bool, str]:
+    """Run scripts/fetch_ligo_real.py to materialize a real-data fixture.
+
+    Returns (ok, message). Heavy: 5–10 min, ~100 MB downloaded. The button
+    that calls this is therefore admin-gated in production.
+    """
+    import subprocess
+    repo_root = Path(__file__).resolve().parent.parent
+    script = repo_root / "scripts" / "fetch_ligo_real.py"
+    out = repo_root / "data" / "ligo_strain_sample.npz"
+    if not script.exists():
+        return False, f"Fetch script not found at {script}"
+    try:
+        proc = subprocess.run(
+            ["python", str(script), "--output", str(out)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Fetch timed out (>15 min). GWOSC may be slow — try again later."
+    if proc.returncode != 0:
+        return False, f"Fetch failed: {proc.stderr.strip()[-400:]}"
+    return True, f"Wrote {out}"
 
 
 def _features_from_strain(strain: np.ndarray, n_qubits: int, encoding: str) -> np.ndarray:
@@ -125,15 +157,42 @@ def render(embed: bool = False) -> None:
     fixture = load_fixture()
     if fixture is None:
         st.warning(
-            "**Strain fixture missing.** Run `python scripts/generate_ligo_fixture.py` "
-            "to materialize `data/ligo_strain_sample.npz`. The demo is otherwise ready."
+            "**Strain fixture missing.** Run "
+            "`python scripts/fetch_ligo_real.py --output data/ligo_strain_sample.npz` "
+            "(real O3 data from GWOSC) or "
+            "`python scripts/generate_ligo_fixture.py --output data/ligo_strain_sample.npz` "
+            "(all-synthetic, no network) to materialize the fixture. The demo is otherwise ready."
         )
+        if not embed and st.button("Fetch real LIGO data now (5–10 min)"):
+            with st.spinner("Downloading O3 strain windows from GWOSC…"):
+                ok, msg = _fetch_real_ligo_data()
+            if ok:
+                st.success(msg + " — reload the page.")
+                load_fixture.clear()
+            else:
+                st.error(msg)
         return
 
     signals, glitches = fixture["signals"], fixture["glitches"]
     if signals.size == 0 or glitches.size == 0:
         st.error("Fixture is empty.")
         return
+
+    # ── data-provenance banner
+    src = fixture.get("source", "unknown")
+    n_real = fixture.get("n_real_events", 0)
+    sr = fixture.get("sample_rate", 4096)
+    cols = st.columns(3)
+    if src == "gwosc-real-o3":
+        cols[0].metric("Data source", "GWOSC O3 (real)")
+        cols[1].metric("Real events", n_real)
+    elif src == "synthetic-pycbc":
+        cols[0].metric("Data source", "PyCBC (synthetic)")
+        cols[1].metric("Real events", "0")
+    else:
+        cols[0].metric("Data source", src)
+        cols[1].metric("Real events", n_real)
+    cols[2].metric("Sample rate", f"{sr} Hz")
 
     with st.sidebar:
         st.markdown("### Hyperparameters")
