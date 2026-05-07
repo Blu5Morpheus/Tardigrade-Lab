@@ -16,6 +16,10 @@ pandas==2.2.3
 
 pennylane==0.39.0
 pennylane-lightning==0.39.0
+# autoray 0.7+ renamed NumpyMimic; pennylane 0.39 still imports the old symbol,
+# so any deploy that resolves a fresh autoray crashes with AttributeError on
+# train. Pin to the last 0.6.x release until we bump pennylane to 0.40+.
+autoray==0.6.12
 
 supabase==2.10.0
 PyGithub==2.5.0
