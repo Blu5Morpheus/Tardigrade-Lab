@@ -324,7 +324,11 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
         # accuracy over the full training set
         if n_classes == 2:
             preds_full = np.array([float(_circuit_out(x, weights)[0]) for x in X])
-            acc = float(((preds_full > 0).astype(int) == y).mean())
+            acc = 0.0 
+            if ep == epochs - 1:
+                # Final accuracy check only
+                preds_full = np.array([float(_circuit_out(x, weights)[0]) for x in X])
+                acc = float(((preds_full > 0).astype(int) == y).mean())
         else:
             logits_full = np.array([np.asarray(_circuit_out(x, weights)) for x in X])
             preds_cls = logits_full.argmax(axis=1)
