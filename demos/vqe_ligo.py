@@ -34,6 +34,7 @@ from typing import Literal
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+import pennylane as qml
 
 from lib.theme import PALETTE, apply_plotly_theme
 
@@ -276,6 +277,7 @@ def _build_clifford_circuit(depth: int, n_classes: int, use_hodge: bool):
 def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed):
     import pennylane as qml
     from pennylane import numpy as pnp
+    import time
 
     rng = np.random.default_rng(int(seed))
     weights = pnp.array(rng.normal(0, 0.1, weights_shape), requires_grad=True)
@@ -291,9 +293,7 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
             return pnp.mean((preds - targets) ** 2)
     else:
         def loss_fn(w, batch_X, batch_y):
-            # logits: stack of 4 expectation values, scaled by a temperature
             logits = pnp.stack([_circuit_out(x, w) for x in batch_X])
-            # softmax cross-entropy
             shift = pnp.max(logits, axis=1, keepdims=True)
             e = pnp.exp(logits - shift)
             probs = e / pnp.sum(e, axis=1, keepdims=True)
@@ -309,37 +309,50 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
         opt = qml.SPSAOptimizer(maxiter=epochs)
 
     history: list[dict] = []
+    
     for ep in range(epochs):
         batch_size = min(32, len(X))
         idx = rng.choice(len(X), size=batch_size, replace=False)
         bX = pnp.array(X[idx], requires_grad=False)
         by = pnp.array(y[idx], requires_grad=False)
 
+        # Optimization step
         if optimizer == "SPSA":
             weights = opt.step(lambda w: loss_fn(w, bX, by), weights)
-            loss_val = float(loss_fn(weights, bX, by))
+            loss_val = loss_fn(weights, bX, by)
         else:
             weights, loss_val = opt.step_and_cost(lambda w: loss_fn(w, bX, by), weights)
 
-        # accuracy over the full training set
-        if n_classes == 2:
-            preds_full = np.array([float(_circuit_out(x, weights)[0]) for x in X])
-            acc = 0.0 
-            if ep == epochs - 1:
-                # Final accuracy check only
-                preds_full = np.array([float(_circuit_out(x, weights)[0]) for x in X])
-                acc = float(((preds_full > 0).astype(int) == y).mean())
-        else:
-            logits_full = np.array([np.asarray(_circuit_out(x, weights)) for x in X])
-            preds_cls = logits_full.argmax(axis=1)
-            acc = float((preds_cls == y).mean())
-        history.append({"epoch": ep, "loss": float(loss_val), "accuracy": acc})
+        # Safely convert loss to float for history tracking
+        loss_item = float(qml.math.to_numpy(loss_val))
 
+        # --- EFFICIENCY LOGIC ---
+        # Only run full-dataset accuracy every 5 epochs to prevent CPU bottlenecking
+        if ep % 5 == 0 or ep == (epochs - 1):
+            if n_classes == 2:
+                preds_full = pnp.stack([_circuit_out(x, weights)[0] for x in X])
+                acc = float(qml.math.to_numpy(((preds_full > 0).astype(int) == y).mean()))
+            else:
+                logits_full = pnp.stack([_circuit_out(x, weights) for x in X])
+                preds_cls = pnp.argmax(logits_full, axis=1)
+                acc = float(qml.math.to_numpy((preds_cls == y).mean()))
+        else:
+            # Carry over last known accuracy to avoid blocking the CPU
+            acc = history[-1]["accuracy"] if history else 0.0
+
+        history.append({"epoch": ep, "loss": loss_item, "accuracy": acc})
+
+        # Tiny sleep to release the Global Interpreter Lock (GIL) 
+        # so Render can handle heartbeat [GET] requests
+        time.sleep(0.01)
+
+    # Final predictions for the UI plots
     if n_classes == 2:
-        final = np.array([float(_circuit_out(x, weights)[0]) for x in X])
+        final = np.array([float(qml.math.to_numpy(_circuit_out(x, weights)[0])) for x in X])
     else:
-        final = np.array([np.asarray(_circuit_out(x, weights)) for x in X])
-    return np.asarray(weights), history, final
+        final = np.array([np.asarray(qml.math.to_numpy(_circuit_out(x, weights))) for x in X])
+        
+    return np.asarray(qml.math.to_numpy(weights)), history, final
 
 
 # ─────────────────────────────────────────────────────────────────────────
