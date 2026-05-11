@@ -286,9 +286,21 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
         out = circuit(x, w)
         return pnp.stack([pnp.asarray(o) for o in out]) if isinstance(out, list) else pnp.asarray(out)
 
+    # Internal helper to run inference in small chunks to prevent CPU plateauing
+    def _get_preds_safe(X_data, w_data):
+        all_preds = []
+        chunk_size = 10 # Small chunks to let the CPU breathe
+        for i in range(0, len(X_data), chunk_size):
+            chunk = X_data[i : i + chunk_size]
+            preds = [_circuit_out(x, w_data) for x in chunk]
+            all_preds.extend(preds)
+            time.sleep(0.01) # Force release of CPU every 10 samples
+        return pnp.stack(all_preds)
+
     if n_classes == 2:
         def loss_fn(w, batch_X, batch_y):
-            preds = pnp.stack([_circuit_out(x, w)[0] for x in batch_X])
+            # Training uses smaller batches (defined in loop), so this is safe
+            preds = pnp.stack([_circuit_out(x, w) for x in batch_X])
             targets = 2 * batch_y - 1
             return pnp.mean((preds - targets) ** 2)
     else:
@@ -301,6 +313,7 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
             picked = pnp.stack([probs[i, idx[i]] for i in range(len(idx))])
             return -pnp.mean(pnp.log(picked + 1e-12))
 
+    # Optimizer selection remains the same
     if optimizer == "Adam":
         opt = qml.AdamOptimizer(stepsize=lr)
     elif optimizer == "Nesterov":
@@ -311,47 +324,39 @@ def _train(circuit, weights_shape, X, y, n_classes, optimizer, lr, epochs, seed)
     history: list[dict] = []
     
     for ep in range(epochs):
-        batch_size = min(32, len(X))
+        # Keep batch_size small (default 32 is okay, 16 is safer for 1-CPU)
+        batch_size = min(16, len(X))
         idx = rng.choice(len(X), size=batch_size, replace=False)
         bX = pnp.array(X[idx], requires_grad=False)
         by = pnp.array(y[idx], requires_grad=False)
 
-        # Optimization step
         if optimizer == "SPSA":
             weights = opt.step(lambda w: loss_fn(w, bX, by), weights)
             loss_val = loss_fn(weights, bX, by)
         else:
+            # Adam/Nesterov use parameter-shift: this is CPU intensive!
             weights, loss_val = opt.step_and_cost(lambda w: loss_fn(w, bX, by), weights)
 
-        # Safely convert loss to float for history tracking
         loss_item = float(qml.math.to_numpy(loss_val))
 
-        # --- EFFICIENCY LOGIC ---
-        # Only run full-dataset accuracy every 5 epochs to prevent CPU bottlenecking
+        # Accuracy check every 5 epochs using the 'Safe' chunked method
         if ep % 5 == 0 or ep == (epochs - 1):
+            preds_full = _get_preds_safe(X, weights)
             if n_classes == 2:
-                preds_full = pnp.stack([_circuit_out(x, weights)[0] for x in X])
-                acc = float(qml.math.to_numpy(((preds_full > 0).astype(int) == y).mean()))
+                acc = float(qml.math.to_numpy(((preds_full[:, 0] > 0).astype(int) == y).mean()))
             else:
-                logits_full = pnp.stack([_circuit_out(x, weights) for x in X])
-                preds_cls = pnp.argmax(logits_full, axis=1)
+                preds_cls = pnp.argmax(preds_full, axis=1)
                 acc = float(qml.math.to_numpy((preds_cls == y).mean()))
         else:
-            # Carry over last known accuracy to avoid blocking the CPU
             acc = history[-1]["accuracy"] if history else 0.0
 
         history.append({"epoch": ep, "loss": loss_item, "accuracy": acc})
+        time.sleep(0.05) # Increased rest time between epochs
 
-        # Tiny sleep to release the Global Interpreter Lock (GIL) 
-        # so Render can handle heartbeat [GET] requests
-        time.sleep(0.01)
-
-    # Final predictions for the UI plots
-    if n_classes == 2:
-        final = np.array([float(qml.math.to_numpy(_circuit_out(x, weights)[0])) for x in X])
-    else:
-        final = np.array([np.asarray(qml.math.to_numpy(_circuit_out(x, weights))) for x in X])
-        
+    # Final predictions using the safe chunked method
+    final_raw = _get_preds_safe(X, weights)
+    final = np.asarray(qml.math.to_numpy(final_raw))
+    
     return np.asarray(qml.math.to_numpy(weights)), history, final
 
 
